@@ -500,15 +500,23 @@ extension MEPlayerItem {
                 if seekToTime != seekTime {
                     continue
                 }
-                isSeek = true
-                allPlayerItemTracks.forEach { $0.seek(time: seekToTime) }
+                // Only rebase the pipeline when the demuxer actually moved.
+                // Flushing tracks and jamming the clocks to an unreachable
+                // target (e.g. a seek past the end of a VOD HLS playlist
+                // returns EIO) starves the renderers: every subsequent frame
+                // decodes "stale" against the jammed clock, playback goes
+                // black and the reader races to EOF.
+                if result >= 0 {
+                    isSeek = true
+                    allPlayerItemTracks.forEach { $0.seek(time: seekToTime) }
+                    audioClock.time = CMTime(seconds: seekToTime, preferredTimescale: time.timescale) + startTime
+                    videoClock.time = CMTime(seconds: seekToTime, preferredTimescale: time.timescale) + startTime
+                }
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.seekingCompletionHandler?(result >= 0)
                     self.seekingCompletionHandler = nil
                 }
-                audioClock.time = CMTime(seconds: seekToTime, preferredTimescale: time.timescale) + startTime
-                videoClock.time = CMTime(seconds: seekToTime, preferredTimescale: time.timescale) + startTime
                 state = .reading
             } else if state == .reading {
                 autoreleasepool {
@@ -603,11 +611,21 @@ extension MEPlayerItem: MediaPlayback {
         guard let formatCtx else {
             return false
         }
-        var seekable = true
-        if let ioContext = formatCtx.pointee.pb {
-            seekable = ioContext.pointee.seekable > 0
+        if let ioContext = formatCtx.pointee.pb, ioContext.pointee.seekable > 0 {
+            return true
         }
-        return seekable
+        // Byte-unseekable IO. HLS is still timestamp-seekable once the
+        // playlist is finished (VOD): hls_read_seek re-resolves the playlist
+        // position and needs no byte seeks, and lavf only sets a duration on
+        // finished playlists, so `duration > 0` keeps live/event streams
+        // non-seekable. This is deliberately scoped to hls — other demuxers'
+        // read_seek (mov, matroska, mpegts, ...) byte-seek the IO internally
+        // and would fail or misread on a non-seekable stream.
+        if duration > 0, let name = formatCtx.pointee.iformat?.pointee.name,
+           String(cString: name) == "hls" {
+            return true
+        }
+        return false
     }
 
     public func prepareToPlay() {

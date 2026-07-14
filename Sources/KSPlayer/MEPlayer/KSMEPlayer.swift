@@ -354,6 +354,7 @@ extension KSMEPlayer: MediaPlayerProtocol {
 
     public func seek(time: TimeInterval, completion: @escaping ((Bool) -> Void)) {
         let time = max(time, 0)
+        let previousPlaybackState = playbackState
         playbackState = .seeking
         runOnMainThread { [weak self] in
             self?.bufferingProgress = 0
@@ -374,6 +375,12 @@ extension KSMEPlayer: MediaPlayerProtocol {
                         CMTimebaseSetTime(controlTimebase, time: CMTimeMake(value: Int64(self.currentPlaybackTime), timescale: 1))
                     }
                 }
+            }
+            if !result {
+                // The demuxer refused the seek (e.g. target past the end of
+                // the playlist) and playback continues where it was — don't
+                // leave the state machine stuck on .seeking.
+                self.playbackState = previousPlaybackState
             }
             completion(result)
         }
