@@ -61,6 +61,9 @@ if FileManager.default.fileExists(atPath: ffmpegKitPath + "/Package.swift") {
     ]
 } else {
     package.dependencies += [
-        .package(url: "https://github.com/kingslay/FFmpegKit.git", from: "6.1.3"),
+        // narrwhal fork: FFmpeg n6.1 with two upstream mov.c cherry-picks
+        // (4cdf2c7f76 "Ignore duplicate ftyp", 380a518c43 "if pos has been
+        // reset, clear fragments and indexes") so seeking works on fMP4 HLS.
+        .package(url: "https://github.com/MarshallOfSound/FFmpegKit.git", branch: "narrwhal-6.1.4"),
     ]
 }
