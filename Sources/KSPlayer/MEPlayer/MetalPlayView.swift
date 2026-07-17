@@ -149,6 +149,9 @@ public final class MetalPlayView: UIView, VideoOutput {
         } else {
             displayView.displayLayer.flushAndRemoveImage()
         }
+        #if os(macOS)
+        displayView.pipLayer.flushAndRemoveImage()
+        #endif
     }
 
     public func invalidate() {
@@ -181,6 +184,12 @@ public final class MetalPlayView: UIView, VideoOutput {
         #endif
         displayView.frame = bounds
     }
+
+    #if os(macOS)
+    /// The layer to build the PiP content source around on macOS (see
+    /// AVSampleBufferDisplayView.pipLayer).
+    public var pipSourceLayer: AVSampleBufferDisplayLayer { displayView.pipLayer }
+    #endif
 
     public func readNextFrame() {
         draw(force: true)
@@ -339,6 +348,18 @@ class AVSampleBufferDisplayView: UIView {
         // swiftlint:enable force_cast
     }
 
+    #if os(macOS)
+    /// Dedicated Picture-in-Picture surface. macOS's PiP window mirrors the
+    /// content-source layer with a coordinate mapping that is only sane
+    /// when the layer sits in a real window's render tree — handing AVKit
+    /// the in-app render layer (sized to the player window, and gone from
+    /// any window once the player screen dismisses) shows an unscaled crop.
+    /// This standalone layer receives every decoded frame alongside the
+    /// render layer; the embedding app hosts it in a small helper window
+    /// for the duration of a PiP session and owns its geometry.
+    let pipLayer = AVSampleBufferDisplayLayer()
+    #endif
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         #if !canImport(UIKit)
@@ -351,6 +372,18 @@ class AVSampleBufferDisplayView: UIView {
             CMTimebaseSetTime(controlTimebase, time: .zero)
             CMTimebaseSetRate(controlTimebase, rate: 1.0)
         }
+        #if os(macOS)
+        pipLayer.anchorPoint = .zero
+        pipLayer.frame = CGRect(x: 0, y: 0, width: 640, height: 360)
+        pipLayer.videoGravity = .resizeAspect
+        var pipTimebase: CMTimebase?
+        CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault, sourceClock: CMClockGetHostTimeClock(), timebaseOut: &pipTimebase)
+        if let pipTimebase {
+            pipLayer.controlTimebase = pipTimebase
+            CMTimebaseSetTime(pipTimebase, time: .zero)
+            CMTimebaseSetRate(pipTimebase, rate: 1.0)
+        }
+        #endif
     }
 
     @available(*, unavailable)
@@ -361,6 +394,9 @@ class AVSampleBufferDisplayView: UIView {
     func enqueue(imageBuffer: CVPixelBuffer, formatDescription: CMVideoFormatDescription, time: CMTime) {
         let timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
         //        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: time, decodeTimeStamp: .invalid)
+        #if os(macOS)
+        enqueuePip(imageBuffer: imageBuffer, formatDescription: formatDescription, timing: timing)
+        #endif
         var sampleBuffer: CMSampleBuffer?
         CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: imageBuffer, formatDescription: formatDescription, sampleTiming: [timing], sampleBufferOut: &sampleBuffer)
         if let sampleBuffer {
@@ -388,6 +424,26 @@ class AVSampleBufferDisplayView: UIView {
             }
         }
     }
+
+    #if os(macOS)
+    /// Mirrors a decoded frame onto the dedicated PiP surface (same pixel
+    /// buffer, fresh CMSampleBuffer — the layers each consume their own).
+    private func enqueuePip(imageBuffer: CVPixelBuffer, formatDescription: CMVideoFormatDescription, timing: CMSampleTimingInfo) {
+        var sampleBuffer: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: imageBuffer, formatDescription: formatDescription, sampleTiming: [timing], sampleBufferOut: &sampleBuffer)
+        guard let sampleBuffer else { return }
+        if let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) as? [NSMutableDictionary], let dic = attachmentsArray.first {
+            dic[kCMSampleAttachmentKey_DisplayImmediately] = true
+        }
+        pipLayer.enqueue(sampleBuffer)
+        if #available(macOS 11.0, *), pipLayer.requiresFlushToResumeDecoding {
+            pipLayer.flush()
+        }
+        if pipLayer.status == .failed {
+            pipLayer.flush()
+        }
+    }
+    #endif
 }
 
 #if os(macOS)

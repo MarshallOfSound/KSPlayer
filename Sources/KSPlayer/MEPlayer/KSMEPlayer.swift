@@ -39,13 +39,26 @@ public class KSMEPlayer: NSObject {
 
     private lazy var _pipController: Any? = {
         if #available(iOS 15.0, tvOS 15.0, macOS 12.0, *), let videoOutput {
-            let contentSource = AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: videoOutput.displayLayer, playbackDelegate: self)
+            let contentSource = AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: pipSourceLayer(fallback: videoOutput.displayLayer), playbackDelegate: self)
             let pip = KSPictureInPictureController(contentSource: contentSource)
             return pip
         } else {
             return nil
         }
     }()
+
+    /// macOS builds the PiP content source around the dedicated PiP surface
+    /// (the window's source mapping is frozen at creation, so the in-app
+    /// render layer's window-sized geometry would show as an unscaled
+    /// crop); iOS/tvOS AVKit manage the hosted layer live, so the render
+    /// layer itself stays the source there.
+    private func pipSourceLayer(fallback: AVSampleBufferDisplayLayer) -> AVSampleBufferDisplayLayer {
+        #if os(macOS)
+        return (videoOutput as? MetalPlayView)?.pipSourceLayer ?? fallback
+        #else
+        return fallback
+        #endif
+    }
 
     @available(tvOS 14.0, *)
     public var pipController: KSPictureInPictureController? {
@@ -397,6 +410,7 @@ extension KSMEPlayer: MediaPlayerProtocol {
         KSLog("play \(self)")
         playbackState = .playing
         if #available(iOS 15.0, tvOS 15.0, macOS 12.0, *) {
+            syncPipTimebase()
             pipController?.invalidatePlaybackState()
         }
     }
@@ -405,7 +419,33 @@ extension KSMEPlayer: MediaPlayerProtocol {
         KSLog("pause \(self)")
         playbackState = .paused
         if #available(iOS 15.0, tvOS 15.0, macOS 12.0, *) {
+            syncPipTimebase()
             pipController?.invalidatePlaybackState()
+        }
+    }
+
+    /// The sample-buffer display layer's control timebase is not media time:
+    /// frames are enqueued with PTS zero + DisplayImmediately, and the
+    /// timebase just free-runs from 0 at rate 1 (wall clock since the view
+    /// was created). Rendering never reads it — but AVKit's PiP window does,
+    /// to place its scrubber. Keep it pinned to the real playhead (rate 0
+    /// while paused) so the window's timeline is honest.
+    private func syncPipTimebase() {
+        guard let videoOutput,
+              let timebase = pipSourceLayer(fallback: videoOutput.displayLayer).controlTimebase else { return }
+        // Both sets are guarded behind a divergence check: AVKit re-reads
+        // playback state on every timebase jump, so an unconditional set
+        // from a query path (timeRangeForPlayback) recurses — set →
+        // timebase notification → invalidate → query → set … — straight
+        // into a stack overflow. A guarded set makes the recursion
+        // terminate on the first in-sync re-entry.
+        let target = currentPlaybackTime
+        let rate = isPlaying ? Double(playbackRate) : 0
+        if abs(CMTimebaseGetTime(timebase).seconds - target) > 0.5 {
+            CMTimebaseSetTime(timebase, time: CMTime(seconds: target, preferredTimescale: 600))
+        }
+        if abs(CMTimebaseGetRate(timebase) - rate) > 0.01 {
+            CMTimebaseSetRate(timebase, rate: rate)
         }
     }
 
@@ -485,6 +525,10 @@ extension KSMEPlayer: AVPictureInPictureSampleBufferPlaybackDelegate {
     }
 
     public func pictureInPictureControllerTimeRangeForPlayback(_: AVPictureInPictureController) -> CMTimeRange {
+        // AVKit queries this on window open and after every
+        // invalidatePlaybackState — the natural hook to keep the layer's
+        // timebase (which positions the window's scrubber) on media time.
+        syncPipTimebase()
         // Handle live streams.
         if duration == 0 {
             return CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
@@ -496,9 +540,19 @@ extension KSMEPlayer: AVPictureInPictureSampleBufferPlaybackDelegate {
         !isPlaying
     }
 
-    public func pictureInPictureController(_: AVPictureInPictureController, didTransitionToRenderSize _: CMVideoDimensions) {}
+    public func pictureInPictureController(_: AVPictureInPictureController, didTransitionToRenderSize size: CMVideoDimensions) {
+        // macOS: the window's source mapping is frozen at content-source
+        // creation, so a post-start resize here has no effect — the surface
+        // is prepared up front instead (MetalPlayView.setPipRenderSize).
+    }
+
     public func pictureInPictureController(_: AVPictureInPictureController, skipByInterval skipInterval: CMTime) async {
-        seek(time: currentPlaybackTime + skipInterval.seconds) { _ in }
+        seek(time: currentPlaybackTime + skipInterval.seconds) { [weak self] _ in
+            if #available(iOS 15.0, tvOS 15.0, macOS 12.0, *) {
+                self?.syncPipTimebase()
+                self?.pipController?.invalidatePlaybackState()
+            }
+        }
     }
 
     public func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(_: AVPictureInPictureController) -> Bool {
@@ -576,7 +630,7 @@ extension KSMEPlayer: AVPlaybackCoordinatorPlaybackControlDelegate {
 extension KSMEPlayer: DisplayLayerDelegate {
     public func change(displayLayer: AVSampleBufferDisplayLayer) {
         if #available(iOS 15.0, tvOS 15.0, macOS 12.0, *) {
-            let contentSource = AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: displayLayer, playbackDelegate: self)
+            let contentSource = AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: pipSourceLayer(fallback: displayLayer), playbackDelegate: self)
             _pipController = KSPictureInPictureController(contentSource: contentSource)
             // 更改contentSource会直接crash
 //            pipController?.contentSource = contentSource
