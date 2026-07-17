@@ -23,6 +23,7 @@ public protocol VideoOutput: FrameOutput {
     init(options: KSOptions)
     func invalidate()
     func readNextFrame()
+    func recreateDisplayLayer()
 }
 
 public final class MetalPlayView: UIView, VideoOutput {
@@ -152,6 +153,33 @@ public final class MetalPlayView: UIView, VideoOutput {
 
     public func invalidate() {
         displayLink.invalidate()
+    }
+
+    /// Rebuilds the sample-buffer display view (same recipe as the
+    /// format-change path in checkFormatDescription). Needed after AVKit
+    /// hands the layer back from a Picture-in-Picture window: the returned
+    /// backing layer doesn't reliably rejoin this view's hierarchy, leaving
+    /// the in-app player black. Recreating the view mints a fresh layer and
+    /// the property observer rewires the PiP content source to it.
+    public func recreateDisplayLayer() {
+        let wasHidden = displayView.isHidden
+        displayView.removeFromSuperview()
+        displayView = AVSampleBufferDisplayView()
+        displayView.isHidden = wasHidden
+        addSubview(displayView)
+        // didAddSubview pinned the fresh view with Auto Layout, but those
+        // constraints don't re-engage inside a player view AVKit has hosted
+        // and handed back — every layout pass resolves the child to zero and
+        // the backing layer clips the video to nothing. Drop them and size by
+        // autoresizing instead, which no layout engine can decline.
+        NSLayoutConstraint.deactivate(constraints.filter { $0.firstItem === displayView || $0.secondItem === displayView })
+        displayView.translatesAutoresizingMaskIntoConstraints = true
+        #if canImport(UIKit)
+        displayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        #else
+        displayView.autoresizingMask = [.width, .height]
+        #endif
+        displayView.frame = bounds
     }
 
     public func readNextFrame() {
