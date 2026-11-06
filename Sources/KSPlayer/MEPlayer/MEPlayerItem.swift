@@ -337,6 +337,13 @@ extension MEPlayerItem {
                 coreStream.pointee.discard = AVDISCARD_ALL
                 if let assetTrack = FFmpegAssetTrack(stream: coreStream) {
                     if assetTrack.mediaType == .subtitle {
+                        // SubtitleDecode rebases cue times by the track's startTime, and the
+                        // playback clock is rebased by the container start, so they must be the
+                        // same value. A subtitle stream's own start_time is the first cue
+                        // whenever avformat_find_stream_info happened to read one (e.g. an MKV
+                        // font attachment with a MIME FFmpeg doesn't know keeps the probe going
+                        // for ~5s), which would shift every cue early by that amount.
+                        assetTrack.startTime = startTime
                         let subtitle = SyncPlayerItemTrack<SubtitleFrame>(mediaType: .subtitle, frameCapacity: 255, options: options)
                         assetTrack.subtitle = subtitle
                         allPlayerItemTracks.append(subtitle)
